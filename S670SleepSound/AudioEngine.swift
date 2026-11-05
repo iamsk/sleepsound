@@ -88,10 +88,10 @@ final class SoundEngine: ObservableObject {
         let sampleRate: Double = 44100
         guard let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2) else { return }
 
-        // 为每种声音独立合成真实的母带级声学 Buffer (10秒长循环，无缝淡入淡出消除接缝)
+        // 为每种声音独立合成真实的母带级声学 Buffer (15秒长循环，采用等功率交叠算法保证 100% 连贯无停顿)
         for sound in SoundType.allCases {
             let player = AVAudioPlayerNode()
-            let buffer = synthesizeBuffer(for: sound, format: format, sampleRate: sampleRate, duration: 10.0)
+            let buffer = synthesizeBuffer(for: sound, format: format, sampleRate: sampleRate, duration: 15.0)
 
             engine.attach(player)
             engine.connect(player, to: engine.mainMixerNode, format: format)
@@ -116,79 +116,91 @@ final class SoundEngine: ObservableObject {
         }
     }
 
-    // MARK: - 核心：为 8 种声音进行精确的声学生成算法
+    // MARK: - 核心：等功率交叠无缝循环合成器 (Equal-Power Overlap-Add Crossfade)
+    /// 彻底解决循环接缝处的停顿、断音与音量下潜，同时原生支持加载真实录音文件
     private func synthesizeBuffer(for sound: SoundType, format: AVAudioFormat, sampleRate: Double, duration: Double) -> AVAudioPCMBuffer {
-        let frameCount = AVAudioFrameCount(sampleRate * duration)
-        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount)!
-        buffer.frameLength = frameCount
+        // 0. 优先检测工程 Bundle 中是否已拖入真实录音文件 (如 fan.wav / fan.m4a / fan.mp3)
+        let extensions = ["wav", "m4a", "mp3", "caf"]
+        for ext in extensions {
+            if let fileURL = Bundle.main.url(forResource: sound.rawValue, withExtension: ext) ??
+                             Bundle.main.url(forResource: sound.title, withExtension: ext) {
+                if let audioFile = try? AVAudioFile(forReading: fileURL),
+                   let fileBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(audioFile.length)) {
+                    do {
+                        try audioFile.read(into: fileBuffer)
+                        return fileBuffer
+                    } catch {
+                        print("Error reading audio file: \(error)")
+                    }
+                }
+            }
+        }
+
+        let totalFrames = Int(sampleRate * duration)
+        let crossfadeFrames = Int(sampleRate * 0.6) // 600ms 黄金平滑交叠区
+        let extendedFrames = totalFrames + crossfadeFrames
+
+        var extendedSamples = [Float](repeating: 0, count: extendedFrames)
+
+        // 1. 生成扩展长度的原生声学生成数据
+        switch sound {
+        case .birds:
+            synthesizeForestBirds(into: &extendedSamples, sampleRate: sampleRate, total: extendedFrames)
+        case .fire:
+            synthesizeCampfire(into: &extendedSamples, sampleRate: sampleRate, total: extendedFrames)
+        case .stream:
+            synthesizeStream(into: &extendedSamples, sampleRate: sampleRate, total: extendedFrames)
+        case .thunder:
+            synthesizeThunderstorm(into: &extendedSamples, sampleRate: sampleRate, total: extendedFrames)
+        case .ocean:
+            synthesizeOceanWaves(into: &extendedSamples, sampleRate: sampleRate, total: extendedFrames)
+        case .fan:
+            synthesizeFan(into: &extendedSamples, sampleRate: sampleRate, total: extendedFrames)
+        case .rain:
+            synthesizeRain(into: &extendedSamples, sampleRate: sampleRate, total: extendedFrames)
+        case .white:
+            synthesizeWhiteNoise(into: &extendedSamples, total: extendedFrames)
+        }
+
+        // 2. 将尾部多出的 crossfadeFrames 通过【等功率三角函数权重】无缝融入头部
+        // 公式：sin^2(θ) + cos^2(θ) = 1.0 (总声能恒定，绝不出现音量下沉或空白停顿)
+        var finalSamples = [Float](repeating: 0, count: totalFrames)
+
+        for i in 0..<crossfadeFrames {
+            let t = Float(i) / Float(crossfadeFrames)
+            let wHead = sin(t * Float.pi * 0.5) // 0 -> 1
+            let wTail = cos(t * Float.pi * 0.5) // 1 -> 0
+            finalSamples[i] = extendedSamples[i] * wHead + extendedSamples[totalFrames + i] * wTail
+        }
+
+        for i in crossfadeFrames..<totalFrames {
+            finalSamples[i] = extendedSamples[i]
+        }
+
+        // 3. 构建 AVAudioPCMBuffer 并输出至左右声道
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(totalFrames))!
+        buffer.frameLength = AVAudioFrameCount(totalFrames)
 
         let left = buffer.floatChannelData![0]
         let right = buffer.floatChannelData![1]
-        let total = Int(frameCount)
-        var rawSamples = [Float](repeating: 0, count: total)
-
-        switch sound {
-        case .birds:
-            // 1. 清晨鸟鸣：林间自然微风背景 + 清晰真实的调频鸟啼声 (Frequency Sweeps & Melodic Trills)
-            synthesizeForestBirds(into: &rawSamples, sampleRate: sampleRate, total: total)
-
-        case .fire:
-            // 2. 温暖篝火：温润火焰轰鸣 + 真实的木炭清脆爆裂声 (Charcoal Crackles & Pops)
-            synthesizeCampfire(into: &rawSamples, sampleRate: sampleRate, total: total)
-
-        case .stream:
-            // 3. 山涧小溪：潺潺水流基底 + 灵动气泡翻滚爆破声 (Water Bubble Bursts)
-            synthesizeStream(into: &rawSamples, sampleRate: sampleRate, total: total)
-
-        case .thunder:
-            // 4. 远雷暴雨：持续雨声背景 + 2 处深沉滚动的低频远雷回荡 (Rolling Sub-bass Thunderclaps)
-            synthesizeThunderstorm(into: &rawSamples, sampleRate: sampleRate, total: total)
-
-        case .ocean:
-            // 5. 潮汐海浪：真实 9 秒呼吸周期的潮涌、拍岸浪花与退潮沙石声 (Ocean Swells & Crashes)
-            synthesizeOceanWaves(into: &rawSamples, sampleRate: sampleRate, total: total)
-
-        case .fan:
-            // 6. 睡眠风扇：120Hz/240Hz 机械电机嗡鸣 + 4.5Hz 扇叶空气旋转扰动 (Blade Air Vortex)
-            synthesizeFan(into: &rawSamples, sampleRate: sampleRate, total: total)
-
-        case .rain:
-            // 7. 舒缓雨声：大雨倾盆背景 + 随机密集雨滴击打声 (Droplet Patter Transients)
-            synthesizeRain(into: &rawSamples, sampleRate: sampleRate, total: total)
-
-        case .white:
-            // 8. 白噪音：全频谱能量完全均匀的高斯平滑白噪
-            synthesizeWhiteNoise(into: &rawSamples, total: total)
-        }
-
-        // 首尾 50ms 跨周期平滑淡入淡出 (消除循环播放时的接缝咔嗒声)
-        let fadeLength = Int(sampleRate * 0.05)
-        for i in 0..<fadeLength {
-            let factor = Float(i) / Float(fadeLength)
-            rawSamples[i] *= factor
-            rawSamples[total - 1 - i] *= factor
-        }
-
-        // 写入左右声道
-        for i in 0..<total {
-            left[i] = rawSamples[i]
-            right[i] = rawSamples[i]
+        for i in 0..<totalFrames {
+            left[i] = finalSamples[i]
+            right[i] = finalSamples[i]
         }
 
         return buffer
     }
 
-    // MARK: - 1. 清晨鸟鸣合成器 (真正婉转悦耳的鸟叫声)
+    // MARK: - 1. 清晨鸟鸣合成器 (真实自然调频鸟啼)
     private func synthesizeForestBirds(into buf: inout [Float], sampleRate: Double, total: Int) {
-        // (1) 森林微风沙沙树叶背景
+        // 森林微风背景 (恒定流动)
         var leafNoise: Float = 0
         for i in 0..<total {
             let white = Float.random(in: -1...1)
             leafNoise = 0.96 * leafNoise + white * 0.04
-            buf[i] = leafNoise * 0.03
+            buf[i] = leafNoise * 0.035
         }
 
-        // (2) 鸟鸣啼叫生成函数 (利用正弦频率快速调制扫频)
         func addChirp(startSec: Double, durSec: Double, fStart: Float, fEnd: Float, peakAmp: Float) {
             let startIdx = Int(startSec * sampleRate)
             let count = Int(durSec * sampleRate)
@@ -203,27 +215,27 @@ final class SoundEngine: ObservableObject {
             }
         }
 
-        // (3) 在 10 秒内编排多组不同品种的自然林间鸟鸣组合 (包括单音啼、双颤音、三连啼)
-        // 第一组：林间知更鸟双颤音 (t = 1.2s ~ 1.6s)
-        addChirp(startSec: 1.1, durSec: 0.14, fStart: 3100, fEnd: 4200, peakAmp: 0.35)
-        addChirp(startSec: 1.3, durSec: 0.18, fStart: 4200, fEnd: 3200, peakAmp: 0.40)
-        addChirp(startSec: 1.55, durSec: 0.12, fStart: 3400, fEnd: 4100, peakAmp: 0.28)
+        // 15 秒内编排 4 组自然鸟啼序列 (结尾预留充足微风余量，避开接缝)
+        // 第 1 组 (t = 1.2s)
+        addChirp(startSec: 1.2, durSec: 0.14, fStart: 3100, fEnd: 4200, peakAmp: 0.35)
+        addChirp(startSec: 1.4, durSec: 0.18, fStart: 4200, fEnd: 3200, peakAmp: 0.40)
+        addChirp(startSec: 1.65, durSec: 0.12, fStart: 3400, fEnd: 4100, peakAmp: 0.28)
 
-        // 第二组：婉转下行林鸟 (t = 3.8s)
-        addChirp(startSec: 3.8, durSec: 0.22, fStart: 3900, fEnd: 2700, peakAmp: 0.42)
-        addChirp(startSec: 4.1, durSec: 0.15, fStart: 2900, fEnd: 3600, peakAmp: 0.32)
+        // 第 2 组 (t = 4.5s)
+        addChirp(startSec: 4.5, durSec: 0.22, fStart: 3900, fEnd: 2700, peakAmp: 0.42)
+        addChirp(startSec: 4.8, durSec: 0.15, fStart: 2900, fEnd: 3600, peakAmp: 0.32)
 
-        // 第三组：清脆短促三音欢鸣 (t = 6.4s)
-        addChirp(startSec: 6.4, durSec: 0.09, fStart: 4200, fEnd: 4700, peakAmp: 0.30)
-        addChirp(startSec: 6.55, durSec: 0.09, fStart: 4700, fEnd: 4200, peakAmp: 0.30)
-        addChirp(startSec: 6.75, durSec: 0.16, fStart: 3600, fEnd: 4400, peakAmp: 0.38)
+        // 第 3 组 (t = 8.2s)
+        addChirp(startSec: 8.2, durSec: 0.09, fStart: 4200, fEnd: 4700, peakAmp: 0.30)
+        addChirp(startSec: 8.35, durSec: 0.09, fStart: 4700, fEnd: 4200, peakAmp: 0.30)
+        addChirp(startSec: 8.55, durSec: 0.16, fStart: 3600, fEnd: 4400, peakAmp: 0.38)
 
-        // 第四组：远方山雀回应 (t = 8.6s)
-        addChirp(startSec: 8.6, durSec: 0.14, fStart: 3200, fEnd: 4100, peakAmp: 0.32)
-        addChirp(startSec: 8.8, durSec: 0.20, fStart: 4100, fEnd: 3000, peakAmp: 0.38)
+        // 第 4 组 (t = 11.5s)
+        addChirp(startSec: 11.5, durSec: 0.14, fStart: 3200, fEnd: 4100, peakAmp: 0.32)
+        addChirp(startSec: 11.7, durSec: 0.20, fStart: 4100, fEnd: 3000, peakAmp: 0.38)
     }
 
-    // MARK: - 2. 温暖篝火合成器 (真实木炭燃烧与清脆劈啪声)
+    // MARK: - 2. 温暖篝火合成器 (连续火焰气流 + 随机木炭清脆爆破)
     private func synthesizeCampfire(into buf: inout [Float], sampleRate: Double, total: Int) {
         var flameNoise: Float = 0
         for i in 0..<total {
@@ -231,7 +243,7 @@ final class SoundEngine: ObservableObject {
             flameNoise = 0.985 * flameNoise + white * 0.03
             buf[i] = flameNoise * 0.18
 
-            // 随机突发清脆木炭爆裂脉冲 (Crackles)
+            // 随机木炭清脆爆裂声
             if Float.random(in: 0...1) < 0.0007 {
                 let popLen = Int(Float.random(in: 0.004...0.015) * Float(sampleRate))
                 let popAmp = Float.random(in: 0.35...0.75)
@@ -248,7 +260,7 @@ final class SoundEngine: ObservableObject {
         }
     }
 
-    // MARK: - 3. 山涧小溪合成器 (流水潺潺与气泡翻滚)
+    // MARK: - 3. 山涧小溪合成器 (流水潺潺 + 翻卷气泡音)
     private func synthesizeStream(into buf: inout [Float], sampleRate: Double, total: Int) {
         var streamBed: Float = 0
         for i in 0..<total {
@@ -256,7 +268,6 @@ final class SoundEngine: ObservableObject {
             streamBed = 0.95 * streamBed + white * 0.08
             buf[i] = streamBed * 0.16
 
-            // 水流翻卷气泡音 (Bubble pinch-off 频率快速上升)
             if Float.random(in: 0...1) < 0.0012 {
                 let bubbleLen = Int(Float.random(in: 0.01...0.025) * Float(sampleRate))
                 let f0 = Float.random(in: 700...1500)
@@ -274,14 +285,13 @@ final class SoundEngine: ObservableObject {
         }
     }
 
-    // MARK: - 4. 远雷暴雨合成器 (暴雨倾盆 + 滚滚低频闷雷)
+    // MARK: - 4. 远雷暴雨合成器 (暴雨基底 + 55Hz 低频闷雷)
     private func synthesizeThunderstorm(into buf: inout [Float], sampleRate: Double, total: Int) {
-        // 雨声基底
+        // 持续雨声基底
         for i in 0..<total {
             buf[i] = Float.random(in: -0.09...0.09)
         }
 
-        // 注入 2 次真实的低沉轰鸣远雷 (t = 2.0s 与 t = 6.8s)
         func addThunder(atSec: Double) {
             let startIdx = Int(atSec * sampleRate)
             let thunderLen = Int(3.2 * sampleRate)
@@ -295,49 +305,89 @@ final class SoundEngine: ObservableObject {
                 buf[idx] += sample
             }
         }
-        addThunder(atSec: 1.8)
-        addThunder(atSec: 6.5)
+
+        // 在 15 秒内分布 3 次自然远雷
+        addThunder(atSec: 2.2)
+        addThunder(atSec: 7.0)
+        addThunder(atSec: 11.8)
     }
 
-    // MARK: - 5. 潮汐海浪合成器 (9秒自然浪涌潮起潮落)
+    // MARK: - 5. 潮汐海浪合成器 (周期完全整除，相位 100% 连贯)
     private func synthesizeOceanWaves(into buf: inout [Float], sampleRate: Double, total: Int) {
         var lowFilter: Float = 0
-        let wavePeriod = 8.5
+        // 5.0 秒为一个潮涌周期，15.0 秒刚好整除为 3 个完整周期，循环边界相位 100% 连续无突变
+        let wavePeriod = 5.0
         for i in 0..<total {
             let timeSec = Double(i) / sampleRate
-            let waveCycle = (sin(2.0 * Double.pi * timeSec / wavePeriod) + 1.0) / 2.0 // 0.0 ~ 1.0
+            let waveCycle = (sin(2.0 * Double.pi * timeSec / wavePeriod) + 1.0) / 2.0
             let white = Float.random(in: -1...1)
             lowFilter = 0.94 * lowFilter + white * 0.06
             
-            // 浪涌高潮时带碎浪花高频
-            let crash = (waveCycle > 0.75) ? (white * Float(waveCycle - 0.75) * 0.25) : 0
+            let crash = (waveCycle > 0.78) ? (white * Float(waveCycle - 0.78) * 0.28) : 0
             buf[i] = (lowFilter * Float(waveCycle * 0.5 + 0.15)) + crash
         }
     }
 
-    // MARK: - 6. 睡眠风扇合成器 (真实电机嗡鸣 + 4.5Hz 扇叶风切律动)
+    // MARK: - 6. 睡眠风扇合成器 (真实物理机身气流与亥姆霍兹共振，彻底剔除正弦波电流音)
     private func synthesizeFan(into buf: inout [Float], sampleRate: Double, total: Int) {
-        var airNoise: Float = 0
+        // 彻底删除 60Hz/120Hz 纯正弦波（消灭手机扬声器振膜失真引起的“电视电流/嗡鸣杂音”）
+        // 采用双极点布朗空气涡流 + 240Hz 声学机壳亥姆霍兹共振腔体滤波 (Helmholtz Resonant Cavity)
+        var b0: Float = 0
+        var b1: Float = 0
+
+        let f0: Double = 240.0
+        let q: Double = 0.85
+        let w0 = 2.0 * Double.pi * f0 / sampleRate
+        let alpha = sin(w0) / (2.0 * q)
+        let b_0 = alpha
+        let b_1 = 0.0
+        let b_2 = -alpha
+        let a_0 = 1.0 + alpha
+        let a_1 = -2.0 * cos(w0)
+        let a_2 = 1.0 - alpha
+
+        let nb0 = Float(b_0 / a_0)
+        let nb1 = Float(b_1 / a_0)
+        let nb2 = Float(b_2 / a_0)
+        let na1 = Float(a_1 / a_0)
+        let na2 = Float(a_2 / a_0)
+
+        var x1: Float = 0
+        var x2: Float = 0
+        var y1: Float = 0
+        var y2: Float = 0
+
         for i in 0..<total {
             let timeSec = Double(i) / sampleRate
-            // 120Hz 电机工频谐波
-            let motor = sin(2.0 * Double.pi * 120.0 * timeSec) * 0.08 + sin(2.0 * Double.pi * 240.0 * timeSec) * 0.03
-            // 4.5Hz 扇叶旋转空气流动调制
-            let bladeMod = 0.75 + 0.25 * sin(2.0 * Double.pi * 4.5 * timeSec)
             let white = Float.random(in: -1...1)
-            airNoise = 0.97 * airNoise + white * 0.04
-            buf[i] = Float(motor) + (airNoise * Float(bladeMod) * 0.35)
+
+            // 真实空气流动与摩擦 (平滑布朗/粉红气流，杜绝任何人工合成电子音)
+            b0 = 0.982 * b0 + white * 0.025
+            b1 = 0.950 * b1 + b0 * 0.050
+            let airBase = b0 * 0.65 + b1 * 0.35
+
+            // 物理腔体共鸣滤波 (模拟真实风扇外壳出风口的深沉风道声)
+            let y = nb0 * airBase + nb1 * x1 + nb2 * x2 - na1 * y1 - na2 * y2
+            x2 = x1
+            x1 = airBase
+            y2 = y1
+            y1 = y
+
+            // 0.85Hz 舒缓自然的扇叶气流慢速起伏
+            let sweep = 0.88 + 0.12 * Float(sin(2.0 * Double.pi * 0.85 * timeSec))
+
+            // 混合输出真实风扇深沉平稳的风道气流声 (零电流音，只有纯净温润的风声)
+            buf[i] = (airBase * 0.72 + y * 0.85) * sweep * 0.44
         }
     }
 
-    // MARK: - 7. 舒缓雨声合成器 (致密水汽雨声 + 雨滴敲打瞬态)
+    // MARK: - 7. 舒缓雨声合成器 (致密水汽雨声 + 密集微雨滴瞬态)
     private func synthesizeRain(into buf: inout [Float], sampleRate: Double, total: Int) {
         var rainBed: Float = 0
         for i in 0..<total {
             let white = Float.random(in: -1...1)
             rainBed = 0.88 * rainBed + white * 0.12
             var sample = rainBed * 0.22
-            // 细密雨滴打击微瞬态
             if Float.random(in: 0...1) < 0.003 {
                 sample += Float.random(in: -0.18...0.18)
             }
